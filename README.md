@@ -22,8 +22,7 @@ The path to the output directory (where unique files will be copied).
 Example:
 
 bash
-Code kopieren
-./SoloCopy /path/to/input /path/to/output
+./SoloCopy path/to/input path/to/output
 Output The program will:
 
 Print the total number of files in the input and output directories.
