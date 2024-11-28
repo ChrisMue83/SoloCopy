@@ -7,13 +7,54 @@
 #include <openssl/evp.h>
 #include <iomanip>
 #include <sstream>
+#include <cstddef>
+
+#ifdef _WIN32
+    #include <windows.h>
+#else
+    #include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
+// Function to retrieve the system's page or block size
+size_t getSystemPageSize() {
+    size_t page_size = 4096; // Default value
+
+    #ifdef _WIN32
+        SYSTEM_INFO sysInfo;
+        GetSystemInfo(&sysInfo);
+        page_size = sysInfo.dwPageSize;
+    #else
+        long res = sysconf(_SC_PAGESIZE);
+        if (res > 0) {
+            page_size = static_cast<size_t>(res);
+        }
+    #endif
+
+    return page_size;
+}
+
+// Function to calculate the optimal buffer size
+size_t calculateOptimalBufferSize() {
+    size_t page_size = getSystemPageSize();
+    size_t multiplier = 256; // Buffer size = 256 * page/block size
+
+    size_t buffer_size = page_size * multiplier;
+
+    // Optional: Set a maximum buffer size, e.g., 8 MB
+    size_t max_buffer_size = 8 * 1024 * 1024; // 8 MB
+    if (buffer_size > max_buffer_size) {
+        buffer_size = max_buffer_size;
+    }
+
+    return buffer_size;
+}
+
 // Function to compute the hash value of a file
 std::string computeHash(const fs::path& filePath) {
-    constexpr std::size_t bufferSize = 4096; // 4 KB
-    unsigned char buffer[bufferSize];
+    size_t bufferSize = calculateOptimalBufferSize();
+    std::vector<unsigned char> buffer(bufferSize);
     unsigned char md_value[EVP_MAX_MD_SIZE];
     unsigned int md_len;
 
@@ -36,8 +77,8 @@ std::string computeHash(const fs::path& filePath) {
         return "";
     }
 
-    while (file.read(reinterpret_cast<char*>(buffer), bufferSize) || file.gcount() > 0) {
-        if (EVP_DigestUpdate(mdctx, buffer, file.gcount()) != 1) {
+    while (file.read(reinterpret_cast<char*>(buffer.data()), bufferSize) || file.gcount() > 0) {
+        if (EVP_DigestUpdate(mdctx, buffer.data(), file.gcount()) != 1) {
             std::cerr << "Error updating the digest." << std::endl;
             EVP_MD_CTX_free(mdctx);
             return "";
@@ -64,29 +105,49 @@ bool isSymlink(const fs::directory_entry& entry) {
     return fs::is_symlink(entry.symlink_status());
 }
 
-// Function to copy a file with manual transfer of attributes
-bool copyFileWithAttributes(const fs::path& source, const fs::path& destination) {
+// Custom function to copy a file with dynamic buffer size and manual attribute transfer
+bool copyFileWithAttributesCustom(const fs::path& source, const fs::path& destination) {
     try {
-        // Copy the file without attributes
-        fs::copy_file(source, destination, fs::copy_options::skip_existing);
+        size_t bufferSize = calculateOptimalBufferSize();
+        std::vector<char> buffer(bufferSize);
 
-        // Copy the permissions
+        std::ifstream src(source, std::ios::binary);
+        if (!src) {
+            std::cerr << "Error opening the source file: " << source << std::endl;
+            return false;
+        }
+
+        std::ofstream dest(destination, std::ios::binary);
+        if (!dest) {
+            std::cerr << "Error creating the destination file: " << destination << std::endl;
+            return false;
+        }
+
+        while (src.read(buffer.data(), bufferSize) || src.gcount() > 0) {
+            dest.write(buffer.data(), src.gcount());
+            if (!dest) {
+                std::cerr << "Error writing to the destination file: " << destination << std::endl;
+                return false;
+            }
+        }
+
+        // Transfer file permissions
         fs::permissions(destination, fs::status(source).permissions());
 
-        // Copy the last write time
+        // Transfer last write time
         auto ftime = fs::last_write_time(source);
         fs::last_write_time(destination, ftime);
 
-        // Other attributes (like owner and group) are platform-specific and require additional implementations
+        // Other attributes like owner and group are platform-specific and require additional implementations
 
         return true;
-    } catch (fs::filesystem_error& e) {
+    } catch (const fs::filesystem_error& e) {
         std::cerr << "Error copying the file: " << e.what() << std::endl;
         return false;
     }
 }
 
-// Function to scan the output directory and group by file size
+// Function to scan the output directory and group files by size
 void scanOutputDirectory(const fs::path& outputPath,
                          std::unordered_map<std::uintmax_t, std::vector<fs::path>>& outputSizeToFiles) {
     for (const auto& entry : fs::directory_iterator(outputPath)) {
@@ -97,7 +158,7 @@ void scanOutputDirectory(const fs::path& outputPath,
     }
 }
 
-// Function to scan the input directory and group by file size
+// Function to scan the input directory and group files by size
 void scanInputDirectory(const fs::path& inputPath,
                         std::unordered_map<std::uintmax_t, std::vector<fs::path>>& inputSizeToFiles,
                         int& filesSkipped,
@@ -149,7 +210,7 @@ void processFiles(const std::unordered_map<std::uintmax_t, std::vector<fs::path>
             const fs::path& file = inputFiles[0];
             fs::path destination = generateUniqueDestination(outputPath, file.filename());
 
-            if (copyFileWithAttributes(file, destination)) {
+            if (copyFileWithAttributesCustom(file, destination)) {
                 filesCopied++;
                 // No need to update hash as the size is unique
             }
@@ -194,7 +255,7 @@ void processFiles(const std::unordered_map<std::uintmax_t, std::vector<fs::path>
                 // Generate a unique destination path
                 fs::path destination = generateUniqueDestination(outputPath, file.filename());
 
-                if (copyFileWithAttributes(file, destination)) {
+                if (copyFileWithAttributesCustom(file, destination)) {
                     filesCopied++;
                     // Add the new hash to the cache
                     outputHashesCache[size].insert(fullHash);
@@ -221,7 +282,7 @@ int main(int argc, char* argv[]) {
     if (!fs::exists(outputPath)) {
         fs::create_directories(outputPath);
     } else if (!fs::is_directory(outputPath)) {
-        std::cerr << "The output directory is not a directory." << std::endl;
+        std::cerr << "The output path is not a directory." << std::endl;
         return 1;
     }
 
@@ -244,13 +305,13 @@ int main(int argc, char* argv[]) {
     // Process files without multithreading
     processFiles(inputSizeToFiles, outputPath, outputSizeToFiles, filesCopied, outputHashesCache);
 
-    // Calculate total files in the input directory
+    // Calculate the total number of files in the input directory
     int totalInputFiles = 0;
     for (const auto& [size, files] : inputSizeToFiles) {
         totalInputFiles += files.size();
     }
 
-    // Calculate total files in the output directory
+    // Calculate the total number of files in the output directory
     int totalOutputFiles = 0;
     for (const auto& [size, files] : outputSizeToFiles) {
         totalOutputFiles += files.size();
