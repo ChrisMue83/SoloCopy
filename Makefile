@@ -1,35 +1,41 @@
+# Makefile for file_copier.cpp with OpenMP and OpenSSL
+
 # Compiler
-CXX = g++
+CXX := g++
 
 # Compiler Flags
-CXXFLAGS = -std=c++20 -pthread -O3 -march=native -flto -DNDEBUG -pipe -Wall -Wextra -Werror
+CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -fopenmp
 
-# Linker Flags
-LDFLAGS = -lssl -lcrypto -flto
+# Include Directories (if OpenSSL is in a non-standard location, add -I/path/to/openssl/include)
+INCLUDES :=
 
-# Target Executable
-TARGET = SoloCopy
+# Library Flags
+# -lssl and -lcrypto link against OpenSSL's SSL and Crypto libraries
+LIBS := -lssl -lcrypto
 
 # Source Files
-SOURCES = SoloCopy.cpp
+SRC := SoloCopy.cpp
 
-# Object Files (Not strictly necessary for single-file projects, but good for scalability)
-OBJECTS = $(SOURCES:.cpp=.o)
+# Object Files
+OBJ := $(SRC:.cpp=.o)
+
+# Executable Name
+EXEC := SoloCopy
 
 # Default Target
-all: $(TARGET)
+all: $(EXEC)
 
 # Link the executable
-$(TARGET): $(SOURCES)
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SOURCES) $(LDFLAGS)
+$(EXEC): $(OBJ)
+	$(CXX) $(CXXFLAGS) $(OBJ) -o $(EXEC) $(LIBS)
 
-# Compile source files to object files (optional for single-file projects)
+# Compile source files to object files
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-# Clean up build artifacts
+# Clean up build files
 clean:
-	rm -f $(TARGET) $(OBJECTS)
+	rm -f $(OBJ) $(EXEC)
 
 # Phony Targets
 .PHONY: all clean

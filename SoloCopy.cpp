@@ -4,10 +4,14 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
+#include <array>
 #include <openssl/evp.h>
 #include <iomanip>
 #include <sstream>
 #include <cstddef>
+#include <functional>
+#include <mutex>
+#include <omp.h> // Include OpenMP header
 
 #ifdef _WIN32
     #include <windows.h>
@@ -17,7 +21,18 @@
 
 namespace fs = std::filesystem;
 
-// Function to retrieve the system's page or block size
+// Custom hash function for std::array<unsigned char, 16>
+struct ArrayHash {
+    std::size_t operator()(const std::array<unsigned char, 16>& arr) const {
+        std::size_t hash = 0;
+        for (const auto& byte : arr) {
+            hash = hash * 31 + byte; // Simple hash combination
+        }
+        return hash;
+    }
+};
+
+// Function to retrieve the system's page size
 size_t getSystemPageSize() {
     size_t page_size = 4096; // Default value
 
@@ -51,53 +66,50 @@ size_t calculateOptimalBufferSize() {
     return buffer_size;
 }
 
-// Function to compute the hash value of a file
-std::string computeHash(const fs::path& filePath) {
+// Function to compute the hash value of a file as a byte array
+std::array<unsigned char, 16> computeHash(const fs::path& filePath) {
     size_t bufferSize = calculateOptimalBufferSize();
     std::vector<unsigned char> buffer(bufferSize);
-    unsigned char md_value[EVP_MAX_MD_SIZE];
-    unsigned int md_len;
+    std::array<unsigned char, 16> hash_value = {0}; // For MD5
+
+    unsigned int hash_length = 0;
 
     EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
     if (mdctx == nullptr) {
         std::cerr << "Error initializing the digest context." << std::endl;
-        return "";
+        return hash_value;
     }
 
     if (EVP_DigestInit_ex(mdctx, EVP_md5(), nullptr) != 1) {
         std::cerr << "Error initializing the digest." << std::endl;
         EVP_MD_CTX_free(mdctx);
-        return "";
+        return hash_value;
     }
 
     std::ifstream file(filePath, std::ios::binary);
     if (!file) {
         std::cerr << "Error opening the file: " << filePath << std::endl;
         EVP_MD_CTX_free(mdctx);
-        return "";
+        return hash_value;
     }
 
     while (file.read(reinterpret_cast<char*>(buffer.data()), bufferSize) || file.gcount() > 0) {
         if (EVP_DigestUpdate(mdctx, buffer.data(), file.gcount()) != 1) {
             std::cerr << "Error updating the digest." << std::endl;
             EVP_MD_CTX_free(mdctx);
-            return "";
+            return hash_value;
         }
     }
 
-    if (EVP_DigestFinal_ex(mdctx, md_value, &md_len) != 1) {
+    if (EVP_DigestFinal_ex(mdctx, hash_value.data(), &hash_length) != 1) {
         std::cerr << "Error finalizing the digest." << std::endl;
         EVP_MD_CTX_free(mdctx);
-        return "";
+        return hash_value;
     }
 
     EVP_MD_CTX_free(mdctx);
 
-    std::stringstream ss;
-    for (unsigned int i = 0; i < md_len; ++i) {
-        ss << std::hex << std::setw(2) << std::setfill('0') << (int)md_value[i];
-    }
-    return ss.str();
+    return hash_value;
 }
 
 // Function to check if an entry is a symbolic link
@@ -193,12 +205,16 @@ fs::path generateUniqueDestination(const fs::path& outputPath, const fs::path& o
     return newDestination;
 }
 
-// Function to process files without multithreading
+// Function to process and copy files with OpenMP parallelization
 void processFiles(const std::unordered_map<std::uintmax_t, std::vector<fs::path>>& inputSizeToFiles,
                  const fs::path& outputPath,
                  const std::unordered_map<std::uintmax_t, std::vector<fs::path>>& outputSizeToFiles,
                  int& filesCopied,
-                 std::unordered_map<std::uintmax_t, std::unordered_set<std::string>>& outputHashesCache) {
+                 std::unordered_map<std::uintmax_t, std::unordered_set<std::array<unsigned char, 16>, ArrayHash>>& outputHashesCache) {
+    // Mutex for protecting access to outputHashesCache and filesCopied
+    std::mutex cacheMutex;
+
+    // Iterate over each file size group in the input
     for (const auto& [size, inputFiles] : inputSizeToFiles) {
         if (inputFiles.empty()) continue;
 
@@ -215,35 +231,69 @@ void processFiles(const std::unordered_map<std::uintmax_t, std::vector<fs::path>
                 // No need to update hash as the size is unique
             }
         } else {
-            // Multiple files with the same size or a file with the same size in the output directory
+            // Multiple files with the same size or size exists in the output directory
             // Compute hashes only when necessary
 
-            // First, if the size exists in the output, ensure hashes for this size are computed
+            // First, if the size exists in the output and hashes are not cached
             if (sizeExistsInOutput && outputHashesCache.find(size) == outputHashesCache.end()) {
-                // Compute and cache hashes for output files of this size
-                std::unordered_set<std::string> hashes;
-                for (const auto& outputFile : outputSizeToFiles.at(size)) {
-                    std::string hash = computeHash(outputFile);
-                    if (!hash.empty()) {
+                // Initialize the hash set for this size
+                std::unordered_set<std::array<unsigned char, 16>, ArrayHash> hashes;
+
+                // Parallelize the hash computation for output files
+                #pragma omp parallel for schedule(dynamic)
+                for (size_t i = 0; i < outputSizeToFiles.at(size).size(); ++i) {
+                    const fs::path& outputFile = outputSizeToFiles.at(size)[i];
+                    std::array<unsigned char, 16> hash = computeHash(outputFile);
+
+                    // Check if the hash was successfully computed (assuming MD5 hash is never all zeros)
+                    bool isValid = false;
+                    for(auto byte : hash){
+                        if(byte != 0){
+                            isValid = true;
+                            break;
+                        }
+                    }
+                    if (isValid) {
+                        #pragma omp critical
                         hashes.insert(hash);
                     }
                 }
-                outputHashesCache[size] = std::move(hashes);
+
+                // Update the cache with the computed hashes
+                {
+                    std::lock_guard<std::mutex> lock(cacheMutex);
+                    outputHashesCache[size] = std::move(hashes);
+                }
             }
 
-            for (const auto& file : inputFiles) {
-                std::string fullHash = computeHash(file);
+            // Parallelize the processing of input files
+            #pragma omp parallel for schedule(dynamic) shared(filesCopied, outputHashesCache, cacheMutex)
+            for (size_t i = 0; i < inputFiles.size(); ++i) {
+                const fs::path& file = inputFiles[i];
+                std::array<unsigned char, 16> fullHash = computeHash(file);
 
-                if (fullHash.empty()) {
+                // Check if the hash was successfully computed
+                bool isValid = false;
+                for(auto byte : fullHash){
+                    if(byte != 0){
+                        isValid = true;
+                        break;
+                    }
+                }
+                if (!isValid) {
                     // Error computing hash, skip
                     continue;
                 }
 
                 // Check if the hash already exists in the output directory
                 bool isDuplicate = false;
-                if (outputHashesCache.find(size) != outputHashesCache.end()) {
-                    if (outputHashesCache[size].find(fullHash) != outputHashesCache[size].end()) {
-                        isDuplicate = true;
+                {
+                    std::lock_guard<std::mutex> lock(cacheMutex);
+                    auto it = outputHashesCache.find(size);
+                    if (it != outputHashesCache.end()) {
+                        if (it->second.find(fullHash) != it->second.end()) {
+                            isDuplicate = true;
+                        }
                     }
                 }
 
@@ -256,9 +306,12 @@ void processFiles(const std::unordered_map<std::uintmax_t, std::vector<fs::path>
                 fs::path destination = generateUniqueDestination(outputPath, file.filename());
 
                 if (copyFileWithAttributesCustom(file, destination)) {
-                    filesCopied++;
-                    // Add the new hash to the cache
-                    outputHashesCache[size].insert(fullHash);
+                    // Update the cache and increment the copied files count
+                    {
+                        std::lock_guard<std::mutex> lock(cacheMutex);
+                        outputHashesCache[size].insert(fullHash);
+                        filesCopied++;
+                    }
                 }
             }
         }
@@ -300,9 +353,9 @@ int main(int argc, char* argv[]) {
     scanInputDirectory(inputPath, inputSizeToFiles, filesSkipped, symlinksCount);
 
     // Data structures for hash caches
-    std::unordered_map<std::uintmax_t, std::unordered_set<std::string>> outputHashesCache;
+    std::unordered_map<std::uintmax_t, std::unordered_set<std::array<unsigned char, 16>, ArrayHash>> outputHashesCache;
 
-    // Process files without multithreading
+    // Process files with OpenMP parallelization
     processFiles(inputSizeToFiles, outputPath, outputSizeToFiles, filesCopied, outputHashesCache);
 
     // Calculate the total number of files in the input directory
@@ -322,7 +375,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Total files in input directory: " << totalInputFiles << std::endl;
     std::cout << "Total files in output directory: " << totalOutputFiles << std::endl;
     std::cout << "Number of files actually copied: " << filesCopied << std::endl;
-    std::cout << "Number of symlinks in input directory: " << symlinksCount << std::endl;
+    std::cout << "Number of symbolic links in input directory: " << symlinksCount << std::endl;
     std::cout << "Number of skipped files (non-regular files): " << filesSkipped << std::endl;
 
     return 0;
