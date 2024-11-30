@@ -5,13 +5,11 @@
 #include <unordered_map>
 #include <vector>
 #include <array>
-#include <openssl/evp.h>
 #include <iomanip>
 #include <sstream>
 #include <cstddef>
 #include <functional>
-#include <mutex>
-#include <omp.h> // Include OpenMP header
+#include <omp.h>
 
 #ifdef _WIN32
     #include <windows.h>
@@ -19,14 +17,18 @@
     #include <unistd.h>
 #endif
 
+// Verwenden von xxHash für schnellere Hash-Berechnungen
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+
 namespace fs = std::filesystem;
 
-// Custom hash function for std::array<unsigned char, 16>
+// Custom hash function for std::array<unsigned char, 8>
 struct ArrayHash {
-    std::size_t operator()(const std::array<unsigned char, 16>& arr) const {
+    std::size_t operator()(const std::array<unsigned char, 8>& arr) const {
         std::size_t hash = 0;
         for (const auto& byte : arr) {
-            hash = hash * 31 + byte; // Simple hash combination
+            hash = hash * 31 + byte;
         }
         return hash;
     }
@@ -66,50 +68,64 @@ size_t calculateOptimalBufferSize() {
     return buffer_size;
 }
 
-// Function to compute the hash value of a file as a byte array
-std::array<unsigned char, 16> computeHash(const fs::path& filePath) {
-    size_t bufferSize = calculateOptimalBufferSize();
-    std::vector<unsigned char> buffer(bufferSize);
-    std::array<unsigned char, 16> hash_value = {0}; // For MD5
-
-    unsigned int hash_length = 0;
-
-    EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
-    if (mdctx == nullptr) {
-        std::cerr << "Error initializing the digest context." << std::endl;
-        return hash_value;
-    }
-
-    if (EVP_DigestInit_ex(mdctx, EVP_md5(), nullptr) != 1) {
-        std::cerr << "Error initializing the digest." << std::endl;
-        EVP_MD_CTX_free(mdctx);
-        return hash_value;
-    }
+// Function to compute a partial hash of a file
+std::array<unsigned char, 8> computePartialHash(const fs::path& filePath) {
+    size_t bufferSize = 64 * 1024; // Read first and last 64 KB
+    std::vector<unsigned char> buffer(bufferSize * 2);
 
     std::ifstream file(filePath, std::ios::binary);
     if (!file) {
-        std::cerr << "Error opening the file: " << filePath << std::endl;
-        EVP_MD_CTX_free(mdctx);
-        return hash_value;
+        // Handle error
+        return {};
     }
+
+    // Read first 64 KB
+    file.read(reinterpret_cast<char*>(buffer.data()), bufferSize);
+    size_t bytesRead = file.gcount();
+
+    // Read last 64 KB
+    file.seekg(-static_cast<std::streamoff>(bufferSize), std::ios::end);
+    file.read(reinterpret_cast<char*>(buffer.data() + bytesRead), bufferSize);
+    size_t totalBytesRead = bytesRead + file.gcount();
+
+    // Compute hash
+    XXH64_hash_t hash = XXH64(buffer.data(), totalBytesRead, 0);
+
+    std::array<unsigned char, 8> hashArr;
+    for (int i = 0; i < 8; ++i) {
+        hashArr[i] = (hash >> (i * 8)) & 0xFF;
+    }
+
+    return hashArr;
+}
+
+// Function to compute the full hash of a file
+std::array<unsigned char, 8> computeFullHash(const fs::path& filePath) {
+    size_t bufferSize = calculateOptimalBufferSize();
+    std::vector<unsigned char> buffer(bufferSize);
+
+    std::ifstream file(filePath, std::ios::binary);
+    if (!file) {
+        // Handle error
+        return {};
+    }
+
+    XXH64_state_t* state = XXH64_createState();
+    XXH64_reset(state, 0);
 
     while (file.read(reinterpret_cast<char*>(buffer.data()), bufferSize) || file.gcount() > 0) {
-        if (EVP_DigestUpdate(mdctx, buffer.data(), file.gcount()) != 1) {
-            std::cerr << "Error updating the digest." << std::endl;
-            EVP_MD_CTX_free(mdctx);
-            return hash_value;
-        }
+        XXH64_update(state, buffer.data(), file.gcount());
     }
 
-    if (EVP_DigestFinal_ex(mdctx, hash_value.data(), &hash_length) != 1) {
-        std::cerr << "Error finalizing the digest." << std::endl;
-        EVP_MD_CTX_free(mdctx);
-        return hash_value;
+    XXH64_hash_t hash = XXH64_digest(state);
+    XXH64_freeState(state);
+
+    std::array<unsigned char, 8> hashArr;
+    for (int i = 0; i < 8; ++i) {
+        hashArr[i] = (hash >> (i * 8)) & 0xFF;
     }
 
-    EVP_MD_CTX_free(mdctx);
-
-    return hash_value;
+    return hashArr;
 }
 
 // Function to check if an entry is a symbolic link
@@ -117,65 +133,33 @@ bool isSymlink(const fs::directory_entry& entry) {
     return fs::is_symlink(entry.symlink_status());
 }
 
-// Custom function to copy a file with dynamic buffer size and manual attribute transfer
-bool copyFileWithAttributesCustom(const fs::path& source, const fs::path& destination) {
-    try {
-        size_t bufferSize = calculateOptimalBufferSize();
-        std::vector<char> buffer(bufferSize);
+// Function to check if one path is a subpath of another
+bool isSubPath(const fs::path& parent, const fs::path& child) {
+    auto parentAbs = fs::canonical(parent);
+    auto childAbs = fs::canonical(child);
 
-        std::ifstream src(source, std::ios::binary);
-        if (!src) {
-            std::cerr << "Error opening the source file: " << source << std::endl;
-            return false;
-        }
-
-        std::ofstream dest(destination, std::ios::binary);
-        if (!dest) {
-            std::cerr << "Error creating the destination file: " << destination << std::endl;
-            return false;
-        }
-
-        while (src.read(buffer.data(), bufferSize) || src.gcount() > 0) {
-            dest.write(buffer.data(), src.gcount());
-            if (!dest) {
-                std::cerr << "Error writing to the destination file: " << destination << std::endl;
-                return false;
-            }
-        }
-
-        // Transfer file permissions
-        fs::permissions(destination, fs::status(source).permissions());
-
-        // Transfer last write time
-        auto ftime = fs::last_write_time(source);
-        fs::last_write_time(destination, ftime);
-
-        // Other attributes like owner and group are platform-specific and require additional implementations
-
+    // If parent and child are the same, return true
+    if (parentAbs == childAbs) {
         return true;
-    } catch (const fs::filesystem_error& e) {
-        std::cerr << "Error copying the file: " << e.what() << std::endl;
-        return false;
     }
+
+    // Check if child path starts with parent path
+    auto mismatchPair = std::mismatch(parentAbs.begin(), parentAbs.end(), childAbs.begin());
+    return mismatchPair.first == parentAbs.end();
 }
 
-// Function to scan the output directory and group files by size
-void scanOutputDirectory(const fs::path& outputPath,
-                         std::unordered_map<std::uintmax_t, std::vector<fs::path>>& outputSizeToFiles) {
-    for (const auto& entry : fs::directory_iterator(outputPath)) {
-        if (!fs::is_regular_file(entry)) continue;
+// Function to scan a directory and collect file sizes and hashes
+void scanDirectory(
+    const fs::path& dirPath,
+    std::unordered_map<std::uintmax_t, std::vector<fs::path>>& sizeToFiles,
+    std::unordered_map<fs::path, std::array<unsigned char, 8>>& fileHashes,
+    int& filesSkipped,
+    int& symlinksCount
+) {
+    std::vector<fs::path> allFiles;
 
-        std::uintmax_t size = fs::file_size(entry.path());
-        outputSizeToFiles[size].emplace_back(entry.path());
-    }
-}
-
-// Function to scan the input directory and group files by size
-void scanInputDirectory(const fs::path& inputPath,
-                        std::unordered_map<std::uintmax_t, std::vector<fs::path>>& inputSizeToFiles,
-                        int& filesSkipped,
-                        int& symlinksCount) {
-    for (const auto& entry : fs::recursive_directory_iterator(inputPath)) {
+    // Collect all files first
+    for (const auto& entry : fs::recursive_directory_iterator(dirPath)) {
         if (isSymlink(entry)) {
             symlinksCount++;
             continue;
@@ -184,8 +168,43 @@ void scanInputDirectory(const fs::path& inputPath,
             filesSkipped++;
             continue;
         }
-        std::uintmax_t size = fs::file_size(entry.path());
-        inputSizeToFiles[size].emplace_back(entry.path());
+        allFiles.emplace_back(entry.path());
+    }
+
+    // Parallelize hash computation
+    size_t numFiles = allFiles.size();
+
+    // Thread-local data
+    int numThreads = omp_get_max_threads();
+    std::vector<std::unordered_map<std::uintmax_t, std::vector<fs::path>>> sizeToFilesPerThread(numThreads);
+    std::vector<std::unordered_map<fs::path, std::array<unsigned char, 8>>> fileHashesPerThread(numThreads);
+
+    #pragma omp parallel
+    {
+        int threadId = omp_get_thread_num();
+        auto& localSizeToFiles = sizeToFilesPerThread[threadId];
+        auto& localFileHashes = fileHashesPerThread[threadId];
+
+        #pragma omp for nowait
+        for (size_t i = 0; i < numFiles; ++i) {
+            const fs::path& filePath = allFiles[i];
+            std::uintmax_t size = fs::file_size(filePath);
+
+            // Compute partial hash
+            std::array<unsigned char, 8> hashValue = computePartialHash(filePath);
+
+            // Add to thread-local structures
+            localSizeToFiles[size].emplace_back(filePath);
+            localFileHashes[filePath] = hashValue;
+        }
+    }
+
+    // Merge thread-local data into global structures
+    for (int i = 0; i < numThreads; ++i) {
+        for (const auto& [size, paths] : sizeToFilesPerThread[i]) {
+            sizeToFiles[size].insert(sizeToFiles[size].end(), paths.begin(), paths.end());
+        }
+        fileHashes.insert(fileHashesPerThread[i].begin(), fileHashesPerThread[i].end());
     }
 }
 
@@ -203,119 +222,6 @@ fs::path generateUniqueDestination(const fs::path& outputPath, const fs::path& o
         suffix++;
     } while (fs::exists(newDestination));
     return newDestination;
-}
-
-// Function to process and copy files with OpenMP parallelization
-void processFiles(const std::unordered_map<std::uintmax_t, std::vector<fs::path>>& inputSizeToFiles,
-                 const fs::path& outputPath,
-                 const std::unordered_map<std::uintmax_t, std::vector<fs::path>>& outputSizeToFiles,
-                 int& filesCopied,
-                 std::unordered_map<std::uintmax_t, std::unordered_set<std::array<unsigned char, 16>, ArrayHash>>& outputHashesCache) {
-    // Mutex for protecting access to outputHashesCache and filesCopied
-    std::mutex cacheMutex;
-
-    // Iterate over each file size group in the input
-    for (const auto& [size, inputFiles] : inputSizeToFiles) {
-        if (inputFiles.empty()) continue;
-
-        bool isUniqueInInput = (inputFiles.size() == 1);
-        bool sizeExistsInOutput = (outputSizeToFiles.find(size) != outputSizeToFiles.end());
-
-        if (isUniqueInInput && !sizeExistsInOutput) {
-            // Unique file size and no matching size in the output directory, copy without hash
-            const fs::path& file = inputFiles[0];
-            fs::path destination = generateUniqueDestination(outputPath, file.filename());
-
-            if (copyFileWithAttributesCustom(file, destination)) {
-                filesCopied++;
-                // No need to update hash as the size is unique
-            }
-        } else {
-            // Multiple files with the same size or size exists in the output directory
-            // Compute hashes only when necessary
-
-            // First, if the size exists in the output and hashes are not cached
-            if (sizeExistsInOutput && outputHashesCache.find(size) == outputHashesCache.end()) {
-                // Initialize the hash set for this size
-                std::unordered_set<std::array<unsigned char, 16>, ArrayHash> hashes;
-
-                // Parallelize the hash computation for output files
-                #pragma omp parallel for schedule(dynamic)
-                for (size_t i = 0; i < outputSizeToFiles.at(size).size(); ++i) {
-                    const fs::path& outputFile = outputSizeToFiles.at(size)[i];
-                    std::array<unsigned char, 16> hash = computeHash(outputFile);
-
-                    // Check if the hash was successfully computed (assuming MD5 hash is never all zeros)
-                    bool isValid = false;
-                    for(auto byte : hash){
-                        if(byte != 0){
-                            isValid = true;
-                            break;
-                        }
-                    }
-                    if (isValid) {
-                        #pragma omp critical
-                        hashes.insert(hash);
-                    }
-                }
-
-                // Update the cache with the computed hashes
-                {
-                    std::lock_guard<std::mutex> lock(cacheMutex);
-                    outputHashesCache[size] = std::move(hashes);
-                }
-            }
-
-            // Parallelize the processing of input files
-            #pragma omp parallel for schedule(dynamic) shared(filesCopied, outputHashesCache, cacheMutex)
-            for (size_t i = 0; i < inputFiles.size(); ++i) {
-                const fs::path& file = inputFiles[i];
-                std::array<unsigned char, 16> fullHash = computeHash(file);
-
-                // Check if the hash was successfully computed
-                bool isValid = false;
-                for(auto byte : fullHash){
-                    if(byte != 0){
-                        isValid = true;
-                        break;
-                    }
-                }
-                if (!isValid) {
-                    // Error computing hash, skip
-                    continue;
-                }
-
-                // Check if the hash already exists in the output directory
-                bool isDuplicate = false;
-                {
-                    std::lock_guard<std::mutex> lock(cacheMutex);
-                    auto it = outputHashesCache.find(size);
-                    if (it != outputHashesCache.end()) {
-                        if (it->second.find(fullHash) != it->second.end()) {
-                            isDuplicate = true;
-                        }
-                    }
-                }
-
-                if (isDuplicate) {
-                    // File is a duplicate, do not copy
-                    continue;
-                }
-
-                // Generate a unique destination path
-                fs::path destination = generateUniqueDestination(outputPath, file.filename());
-
-                if (copyFileWithAttributesCustom(file, destination)) {
-                    // Update the cache and increment the copied files count
-                    {
-                        std::lock_guard<std::mutex> lock(cacheMutex);
-                        outputHashesCache[size].insert(fullHash);
-                        filesCopied++;
-                    }
-                }
-            }
-        }
-    }
 }
 
 int main(int argc, char* argv[]) {
@@ -339,44 +245,157 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Initialize counters
-    int filesCopied = 0;
-    int filesSkipped = 0;
-    int symlinksCount = 0;
-
-    // Scan the output directory
-    std::unordered_map<std::uintmax_t, std::vector<fs::path>> outputSizeToFiles;
-    scanOutputDirectory(outputPath, outputSizeToFiles);
-
-    // Scan the input directory
-    std::unordered_map<std::uintmax_t, std::vector<fs::path>> inputSizeToFiles;
-    scanInputDirectory(inputPath, inputSizeToFiles, filesSkipped, symlinksCount);
-
-    // Data structures for hash caches
-    std::unordered_map<std::uintmax_t, std::unordered_set<std::array<unsigned char, 16>, ArrayHash>> outputHashesCache;
-
-    // Process files with OpenMP parallelization
-    processFiles(inputSizeToFiles, outputPath, outputSizeToFiles, filesCopied, outputHashesCache);
-
-    // Calculate the total number of files in the input directory
-    int totalInputFiles = 0;
-    for (const auto& [size, files] : inputSizeToFiles) {
-        totalInputFiles += files.size();
+    // Ensure that input and output directories are not the same and not nested
+    if (fs::equivalent(inputPath, outputPath)) {
+        std::cerr << "Input and output directories cannot be the same." << std::endl;
+        return 1;
     }
 
-    // Calculate the total number of files in the output directory
+    if (isSubPath(inputPath, outputPath) || isSubPath(outputPath, inputPath)) {
+        std::cerr << "Input and output directories must not be nested within each other." << std::endl;
+        return 1;
+    }
+
+    // Initialize counters
+    int filesCopied = 0;
+    int filesSkippedInput = 0;
+    int symlinksCountInput = 0;
+    int filesSkippedOutput = 0;
+    int symlinksCountOutput = 0;
+
+    // Data structures for input and output directories
+    std::unordered_map<std::uintmax_t, std::vector<fs::path>> inputSizeToFiles;
+    std::unordered_map<fs::path, std::array<unsigned char, 8>> inputFileHashes;
+
+    std::unordered_map<std::uintmax_t, std::vector<fs::path>> outputSizeToFiles;
+    std::unordered_map<fs::path, std::array<unsigned char, 8>> outputFileHashes;
+
+    // Scan and compute hashes for the output directory
+    std::cout << "Scanning and hashing output directory..." << std::endl;
+    scanDirectory(outputPath, outputSizeToFiles, outputFileHashes, filesSkippedOutput, symlinksCountOutput);
+    std::cout << "Finished scanning and hashing output directory." << std::endl;
     int totalOutputFiles = 0;
     for (const auto& [size, files] : outputSizeToFiles) {
         totalOutputFiles += files.size();
     }
+    std::cout << "Total files in output directory: " << totalOutputFiles << std::endl << std::endl;
+
+    // Scan and compute hashes for the input directory
+    std::cout << "Scanning and hashing input directory..." << std::endl;
+    scanDirectory(inputPath, inputSizeToFiles, inputFileHashes, filesSkippedInput, symlinksCountInput);
+    std::cout << "Finished scanning and hashing input directory." << std::endl;
+    int totalInputFiles = 0;
+    for (const auto& [size, files] : inputSizeToFiles) {
+        totalInputFiles += files.size();
+    }
+    std::cout << "Total files in input directory: " << totalInputFiles << std::endl << std::endl;
+
+    // After all data is collected, begin processing
+    std::cout << "Starting file comparison and copying..." << std::endl;
+
+    int progressCounter = 0;
+    int totalFilesToProcess = totalInputFiles;
+    int progressStep = totalFilesToProcess / 100; // For percentage progress
+    if (progressStep == 0) progressStep = 1; // Ensure progressStep is at least 1
+
+    // Set to keep track of already copied hashes to avoid duplicates from input directory
+    std::unordered_set<std::array<unsigned char, 8>, ArrayHash> copiedHashes;
+
+    int duplicateFilesSkipped = 0; // Counter for duplicates in input directory
+
+    // Vector to store files to copy
+    std::vector<std::pair<fs::path, fs::path>> filesToCopy;
+
+    // Process files
+    for (const auto& [size, inputFiles] : inputSizeToFiles) {
+        // Check if size exists in output directory
+        bool sizeExistsInOutput = (outputSizeToFiles.find(size) != outputSizeToFiles.end());
+
+        for (const auto& file : inputFiles) {
+            progressCounter++;
+
+            // Progress indicator
+            if (progressCounter % (progressStep * 10) == 0 || progressCounter == totalFilesToProcess) {
+                int percent = (progressCounter * 100) / totalFilesToProcess;
+                std::cout << "Progress: " << percent << "% (" << progressCounter << "/" << totalFilesToProcess << " files processed)" << "\r" << std::flush;
+            }
+
+            // Get partial hash from inputFileHashes
+            std::array<unsigned char, 8> inputHash = inputFileHashes[file];
+
+            bool isDuplicate = false;
+
+            // Check if the hash has already been copied from input directory
+            if (copiedHashes.find(inputHash) != copiedHashes.end()) {
+                isDuplicate = true;
+                duplicateFilesSkipped++;
+            }
+            // Check if hash exists in outputFileHashes
+            else if (sizeExistsInOutput) {
+                for (const auto& outputFile : outputSizeToFiles[size]) {
+                    if (outputFileHashes[outputFile] == inputHash) {
+                        isDuplicate = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!isDuplicate) {
+                // Need to compute full hash to confirm
+                std::array<unsigned char, 8> fullInputHash = computeFullHash(file);
+
+                bool fullDuplicate = false;
+
+                // Check in copiedHashes again with full hash
+                if (copiedHashes.find(fullInputHash) != copiedHashes.end()) {
+                    fullDuplicate = true;
+                    duplicateFilesSkipped++;
+                } else if (sizeExistsInOutput) {
+                    for (const auto& outputFile : outputSizeToFiles[size]) {
+                        std::array<unsigned char, 8> fullOutputHash = computeFullHash(outputFile);
+                        if (fullOutputHash == fullInputHash) {
+                            fullDuplicate = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!fullDuplicate) {
+                    fs::path destination = generateUniqueDestination(outputPath, file.filename());
+                    filesToCopy.emplace_back(file, destination);
+                    copiedHashes.insert(fullInputHash); // Add the full hash to the set of copied hashes
+                } else {
+                    duplicateFilesSkipped++;
+                }
+            }
+        }
+    }
+
+    std::cout << std::endl << "Starting parallel file copying..." << std::endl;
+
+    // Parallel file copying
+    #pragma omp parallel for schedule(dynamic)
+    for (size_t i = 0; i < filesToCopy.size(); ++i) {
+        const auto& [source, destination] = filesToCopy[i];
+        if (fs::copy_file(source, destination, fs::copy_options::overwrite_existing)) {
+            #pragma omp atomic
+            filesCopied++;
+        }
+    }
+
+    std::cout << "File copying completed." << std::endl << std::endl;
+
+    // Recalculate the total number of files in the output directory after copying
+    totalOutputFiles += filesCopied; // Add the newly copied files
 
     // Output summary
     std::cout << "Processing completed." << std::endl;
     std::cout << "Total files in input directory: " << totalInputFiles << std::endl;
     std::cout << "Total files in output directory: " << totalOutputFiles << std::endl;
     std::cout << "Number of files actually copied: " << filesCopied << std::endl;
-    std::cout << "Number of symbolic links in input directory: " << symlinksCount << std::endl;
-    std::cout << "Number of skipped files (non-regular files): " << filesSkipped << std::endl;
+    std::cout << "Number of duplicate files skipped in input directory: " << duplicateFilesSkipped << std::endl;
+    std::cout << "Number of symbolic links in input directory: " << symlinksCountInput << std::endl;
+    std::cout << "Number of skipped files in input directory (non-regular files): " << filesSkippedInput << std::endl;
 
     return 0;
 }
